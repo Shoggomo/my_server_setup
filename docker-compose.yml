@@ -1,0 +1,178 @@
+
+services:
+##############################
+# Infrastructure
+##############################
+
+  traefik:
+    image: traefik:v2.10
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.file.filename=/config/config.yaml
+      # Debugging
+      - --log.level=DEBUG
+      - --log.filePath=/logs/traefik.log
+      - --accesslog.filepath=/logs/access.log
+      - --accesslog.format=json
+      - --accesslog.fields.headers.defaultmode=keep
+      - --api.insecure=true
+      - --api.dashboard=true
+      
+      # Plugins
+      # Dont forget to setup IPv6 support and enable NAT via ip6tables for every ipv6 network
+      #  https://medium.com/@skleeschulte/how-to-enable-ipv6-for-docker-containers-on-ubuntu-18-04-c68394a219a2#7ae3
+      - --experimental.plugins.traefik_dynamic_public_whitelist.modulename=github.com/Shoggomo/traefik_dynamic_public_whitelist
+      - --experimental.plugins.traefik_dynamic_public_whitelist.version=v0.1.5
+      - --providers.plugin.traefik_dynamic_public_whitelist.whitelistIPv6=true
+      - --providers.plugin.traefik_dynamic_public_whitelist.additionalSourceRange=192.168.0.1/24
+      # Set up an insecure listener that redirects all traffic to TLS
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.websecure.address=:443
+      # Set up the TLS configuration for our websecure listener
+      - --entrypoints.websecure.http.tls=true
+      - --entrypoints.websecure.http.tls.certresolver=myresolver
+      - --entrypoints.websecure.http.tls.domains[0].main=${DOMAIN}
+      - --entrypoints.websecure.http.tls.domains[0].sans=*.${DOMAIN}      
+      # Set up LetsEncrypt
+      - --certificatesresolvers.myresolver.acme.dnschallenge=true
+      - --certificatesresolvers.myresolver.acme.dnschallenge.provider=cloudflare
+      - --certificatesresolvers.myresolver.acme.email=${CERTIFICATE_EMAIL}
+      - --certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json
+    ports:
+      - "80:80"
+      - "8080:8080"
+      - "443:443"
+    volumes:
+      - ./volumes/traefik/letsencrypt:/letsencrypt
+      - ./volumes/traefik/logs:/logs
+      - ./volumes/traefik/config:/config
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - portainer-net
+      - traefik-net
+      - pihole-net
+      - deconz-net
+    labels:
+      - traefik.enable=true
+      # Traefik Dashboard config
+      - traefik.http.services.traefik.loadbalancer.server.port=8080
+      - traefik.http.routers.traefik.rule=Host(`traefik.${DOMAIN}`)
+      - traefik.http.routers.traefik.entrypoints=websecure
+      - traefik.http.routers.traefik.service=traefik  # only needed, because here are multiple services
+      - traefik.http.routers.traefik.middlewares=public_ipwhitelist@plugin-traefik_dynamic_public_whitelist
+      # External/legacy Services
+      - traefik.http.routers.nextcloud-legacy.rule=(Host(`www.${DOMAIN}`) || Host(`${DOMAIN}`)) && PathPrefix(`/owncloud`)
+      - traefik.http.routers.nextcloud-legacy.entrypoints=websecure
+      - traefik.http.routers.nextcloud-legacy.service=nextcloud@file
+
+      - traefik.http.routers.nextcloud.rule=Host(`nc.${DOMAIN}`)
+      - traefik.http.routers.nextcloud.entrypoints=websecure
+      - traefik.http.routers.nextcloud.service=nextcloud@file      
+      - traefik.http.routers.nextcloud.middlewares=add-owncloud
+      - traefik.http.middlewares.add-owncloud.redirectregex.regex=^(https?://nc.${DOMAIN})/?$
+      - traefik.http.middlewares.add-owncloud.redirectregex.replacement=$1/owncloud/
+    environment:
+      - CF_DNS_API_TOKEN=${CF_API_TOKEN}
+      
+      
+  portainer:
+    image: portainer/portainer-ce:latest
+    container_name: portainer
+    restart: unless-stopped
+    volumes:
+      - ./volumes/portainer/portainer_data:/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - portainer-net
+    labels:
+      - traefik.enable=true
+      - traefik.http.services.portainer.loadbalancer.server.port=9000
+      - traefik.http.routers.portainer.rule=Host(`portainer.${DOMAIN}`)   
+      - traefik.http.routers.portainer.entrypoints=websecure
+      - traefik.http.routers.portainer.middlewares=public_ipwhitelist@plugin-traefik_dynamic_public_whitelist
+    
+    
+  ddns:
+    image: oznu/cloudflare-ddns:latest
+    container_name: cloudflare-ddns
+    restart: unless-stopped
+    environment:
+      - API_KEY=${CF_API_TOKEN}
+      - ZONE=${DOMAIN}
+      - PROXIED=false
+
+##############################      
+# Services
+##############################
+
+
+  pihole:
+    image: pihole/pihole:latest
+    container_name: pihole
+    restart: unless-stopped
+    # For Ubuntu: in /etc/systemd/resolved.conf set DNSStubListener=no and restart systemd-resolved service to free port 53
+    ports:
+      - "53:53/tcp"
+      - "53:53/udp"
+      - "67:67/udp" # Only required if you are using Pi-hole as your DHCP server
+      - "8082:80/tcp"
+    environment:
+      TZ: 'Europe/Berlin'
+      WEBPASSWORD: ${PIHOLE_WEB_PASSWORD}
+      WEB_PORT: 80
+    volumes:
+      - ./volumes/pihole/etc-pihole:/etc/pihole
+      - ./volumes/pihole/etc-dnsmasq.d:/etc/dnsmasq.d
+    cap_add:
+      - NET_ADMIN
+    networks:
+      - pihole-net
+    labels:   
+      - traefik.enable=true
+      - traefik.http.services.pihole.loadbalancer.server.port=80
+      - traefik.http.routers.pihole.rule=Host(`pihole.${DOMAIN}`)
+      - traefik.http.routers.pihole.entrypoints=websecure
+      - traefik.http.routers.pihole.middlewares=public_ipwhitelist@plugin-traefik_dynamic_public_whitelist, add-admin
+      - traefik.http.middlewares.add-admin.redirectregex.regex=^(https?://pihole.${DOMAIN})/?$
+      - traefik.http.middlewares.add-admin.redirectregex.replacement=$1/admin/
+  
+
+  deconz:
+    container_name: deconz
+    image: deconzcommunity/deconz:latest
+    restart: unless-stopped
+    #ports:
+    #  - "8083:8083" # Need to be equal
+    #  - "8084:8084" # Need to be equal
+    volumes:
+      - ./volumes/deCONZ:/opt/deCONZ
+      - /etc/localtime:/etc/localtime:ro
+    networks:
+      - deconz-net
+    devices:
+      - /dev/ttyACM0
+    environment:
+      - DECONZ_WEB_PORT=8080
+      - DECONZ_WS_PORT=443
+    labels:   
+      - traefik.enable=true
+      - traefik.http.services.deconz.loadbalancer.server.port=8080
+      - traefik.http.routers.deconz.rule=Host(`deconz.${DOMAIN}`)
+      - traefik.http.routers.deconz.entrypoints=websecure
+      - traefik.http.routers.deconz.middlewares=public_ipwhitelist@plugin-traefik_dynamic_public_whitelist
+          
+
+networks:
+  traefik-net:
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: fd01::1/80  # Don't forget to add ip6table entry
+  portainer-net:
+  pihole-net:
+  deconz-net:
